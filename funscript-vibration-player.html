@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Funscript Vibration Player</title>
+<style>
+  :root { color-scheme: dark; --bg:#14151a; --card:#1e2028; --fg:#eceef3; --muted:#9aa0ae; --accent:#7c9cff; --warn:#ffb86b; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui, sans-serif; max-width:720px; margin-inline:auto; }
+  h1 { font-size:1.25rem; margin:0 0 4px; }
+  p.sub { margin:0 0 16px; color:var(--muted); font-size:.9rem; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:6px; }
+  input[type=file] { width:100%; color:var(--fg); }
+  input[type=range], select { width:100%; }
+  select { background:#2a2d38; color:var(--fg); border:0; border-radius:8px; padding:10px; font-size:1rem; }
+  video { width:100%; max-height:55vh; background:#000; border-radius:12px; display:block; }
+  button { background:var(--accent); color:#0b1020; border:0; border-radius:8px; padding:10px 14px; font-size:1rem; font-weight:600; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .val { color:var(--fg); font-variant-numeric:tabular-nums; }
+  .meter { height:10px; background:#2a2d38; border-radius:6px; overflow:hidden; }
+  .meter > div { height:100%; width:0; background:var(--accent); transition:width .08s linear; }
+  .status { font-size:.85rem; color:var(--muted); margin-top:6px; }
+  .warn { color:var(--warn); }
+</style>
+</head>
+<body>
+  <h1>Funscript Vibration Player</h1>
+  <p class="sub">Plays a video and vibrates your phone in time with a .funscript. Everything stays on your device.</p>
+
+  <div id="support" class="card warn" hidden>
+    This browser doesn't support vibration. Use Chrome on Android (iPhones don't allow it).
+  </div>
+
+  <div class="card">
+    <label for="videoFile">1. Video</label>
+    <input id="videoFile" type="file" accept="video/*">
+    <div style="height:12px"></div>
+    <label for="scriptFile">2. Funscript</label>
+    <input id="scriptFile" type="file">
+    <div id="scriptStatus" class="status">No script loaded.</div>
+  </div>
+
+  <video id="video" controls playsinline></video>
+
+  <div class="card" style="margin-top:12px">
+    <label>Live vibration level</label>
+    <div class="meter"><div id="meter"></div></div>
+  </div>
+
+  <div class="card">
+    <label for="mode">Mode</label>
+    <select id="mode">
+      <option value="speed">Stroke speed (faster motion = stronger)</option>
+      <option value="pos">Position (higher position = stronger)</option>
+    </select>
+    <div style="height:14px"></div>
+    <div class="row"><label for="gain" style="margin:0">Strength</label><span id="gainVal" class="val">1.00×</span></div>
+    <input id="gain" type="range" min="0.3" max="2.5" step="0.05" value="1">
+    <div style="height:14px"></div>
+    <div class="row"><label for="offset" style="margin:0">Sync offset (positive = vibrate later)</label><span id="offsetVal" class="val">0 ms</span></div>
+    <input id="offset" type="range" min="-1000" max="1000" step="10" value="0">
+    <div style="height:14px"></div>
+    <button id="test" type="button">Test vibration</button>
+    <div class="status">Keep the screen on and this tab in front while playing. Vibration also needs your phone's vibration enabled and battery saver off.</div>
+  </div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video');
+  const canVibrate = 'vibrate' in navigator;
+  if (!canVibrate) $('support').hidden = false;
+
+  const TICK = 100;      // how often we update (ms)
+  const CYCLE = 25;      // on/off cycle used to fake intensity (ms)
+  const REF_SPEED = 300; // funscript units/sec treated as "full strength" at 1.0x
+  const MAX_GAP = 2000;  // gaps longer than this (ms) count as no motion
+
+  let actions = [];
+  let timer = null;
+  let wakeLock = null;
+  let gain = 1, offset = 0, mode = 'speed';
+
+  const clamp = x => Math.max(0, Math.min(1, x));
+
+  // ----- files -----
+  $('videoFile').addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (video.dataset.url) URL.revokeObjectURL(video.dataset.url);
+    const url = URL.createObjectURL(f);
+    video.dataset.url = url;
+    video.src = url;
+  });
+
+  $('scriptFile').addEventListener('change', async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const json = JSON.parse(await f.text());
+      const list = (json.actions || [])
+        .map(a => ({ t: Number(a.at), p: Number(a.pos) }))
+        .filter(a => Number.isFinite(a.t) && Number.isFinite(a.p))
+        .sort((a, b) => a.t - b.t);
+      if (!list.length) throw new Error('no actions found');
+      actions = list;
+      const secs = Math.round(list[list.length - 1].t / 1000);
+      $('scriptStatus').textContent = `Loaded ${list.length} actions (${Math.floor(secs / 60)}m ${secs % 60}s).`;
+    } catch (err) {
+      actions = [];
+      $('scriptStatus').textContent = 'Could not read that file as a funscript (' + err.message + ').';
+    }
+  });
+
+  // ----- settings -----
+  $('gain').addEventListener('input', e => { gain = +e.target.value; $('gainVal').textContent = gain.toFixed(2) + '×'; });
+  $('offset').addEventListener('input', e => { offset = +e.target.value; $('offsetVal').textContent = offset + ' ms'; });
+  $('mode').addEventListener('change', e => { mode = e.target.value; });
+  $('test').addEventListener('click', () => { if (canVibrate) navigator.vibrate([200, 100, 200, 100, 400]); });
+
+  // ----- script lookup -----
+  function findIndex(t) { // last action with time <= t
+    let lo = 0, hi = actions.length - 1, ans = -1;
+    while (lo <= hi) {
+      const m = (lo + hi) >> 1;
+      if (actions[m].t <= t) { ans = m; lo = m + 1; } else hi = m - 1;
+    }
+    return ans;
+  }
+
+  function levelAt(t) {
+    const i = findIndex(t);
+    if (i < 0 || i >= actions.length - 1) return 0;
+    const a = actions[i], b = actions[i + 1], dt = b.t - a.t;
+    if (dt <= 0 || dt > MAX_GAP) return 0;
+    if (mode === 'pos') {
+      const f = (t - a.t) / dt;
+      return clamp(((a.p + (b.p - a.p) * f) / 100) * gain);
+    }
+    const speed = Math.abs(b.p - a.p) / (dt / 1000);
+    return clamp((speed / REF_SPEED) * gain);
+  }
+
+  // Phones only have on/off vibration, so intensity is faked by pulsing quickly.
+  function pulse(level) {
+    if (!canVibrate) return;
+    if (level < 0.08) { navigator.vibrate(0); return; }
+    if (level > 0.92) { navigator.vibrate(TICK + 20); return; }
+    const on = Math.max(5, Math.round(CYCLE * level));
+    const off = CYCLE - on;
+    const pattern = [];
+    for (let t = 0; t < TICK; t += CYCLE) pattern.push(on, off);
+    navigator.vibrate(pattern);
+  }
+
+  function tick() {
+    if (video.paused || video.ended || !actions.length) return;
+    const t = video.currentTime * 1000 - offset + TICK / 2;
+    const level = levelAt(t);
+    $('meter').style.width = Math.round(level * 100) + '%';
+    pulse(level);
+  }
+
+  // ----- playback hooks -----
+  async function start() {
+    stop(false);
+    timer = setInterval(tick, TICK);
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+
+  function stop(releaseLock = true) {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (canVibrate) navigator.vibrate(0);
+    $('meter').style.width = '0%';
+    if (releaseLock && wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+
+  video.addEventListener('play', start);
+  video.addEventListener('playing', start);
+  ['pause', 'ended', 'seeking', 'waiting'].forEach(ev => video.addEventListener(ev, () => stop(ev === 'pause' || ev === 'ended')));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else if (!video.paused) start(); });
+})();
+</script>
+</body>
+</html>
